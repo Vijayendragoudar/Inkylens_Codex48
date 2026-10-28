@@ -76,7 +76,7 @@ def load_settings() -> Settings:
 
     default_models = {
         "openai": "gpt-4o-mini",
-        "groq": "llama-3.3-70b-versatile",
+        "groq": "openai/gpt-oss-20b",
         "gemini": "gemini-3.8-flash",
     }
 
