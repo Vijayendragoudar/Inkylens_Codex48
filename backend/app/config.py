@@ -22,7 +22,6 @@ def _positive_float(value: str | None, default: float) -> float:
 
 
 def _default_database_url() -> str:
-    """Use a writable but non-durable database location on serverless demos."""
     if os.getenv("VERCEL"):
         return "sqlite:////tmp/inkylens.db"
     return "sqlite:///./inkylens.db"
@@ -30,25 +29,29 @@ def _default_database_url() -> str:
 
 @dataclass(frozen=True)
 class Settings:
+    # Original fields remain first for positional compatibility.
     database_url: str
     openai_api_key: str | None = None
     openai_model: str = "gpt-4o-mini"
     ai_timeout_seconds: float = 20.0
 
-    # Multi-provider settings; defaults preserve legacy constructor calls.
+    # Multi-provider settings.
     ai_provider: str = "openai"
     ai_api_key: str | None = None
     ai_base_url: str | None = None
     ai_model: str = "gpt-4o-mini"
 
     def __post_init__(self) -> None:
-        # Old tests and callers pass only openai_api_key/openai_model.
-        # Use those values when the newer provider fields aren't supplied.
+        # Fall back to legacy OpenAI settings when new fields aren't supplied.
         if self.ai_api_key is None and self.openai_api_key:
             object.__setattr__(self, "ai_api_key", self.openai_api_key)
 
-        if self.ai_model == "gpt-4o-mini" and self.openai_model:
-            if self.ai_provider == "openai":
+        if self.ai_provider == "openai":
+            if self.ai_base_url is None:
+                object.__setattr__(
+                    self, "ai_base_url", "https://api.openai.com/v1"
+                )
+            if self.ai_model == "gpt-4o-mini" and self.openai_model:
                 object.__setattr__(self, "ai_model", self.openai_model)
 
     @property
@@ -81,8 +84,10 @@ def load_settings() -> Settings:
         "gemini": "gemini-3.8-flash",
     }
 
-    configured_model = os.getenv("INKYLENS_AI_MODEL", "").strip()
-    selected_model = configured_model or default_models.get(provider, "")
+    selected_model = (
+        os.getenv("INKYLENS_AI_MODEL", "").strip()
+        or default_models.get(provider, "")
+    )
 
     return Settings(
         database_url=os.getenv(
