@@ -1,4 +1,4 @@
-"""Server-side, schema-validated optional AI review adapter."""
+"""Server-side, schema-validated AI review adapter for Inkylens."""
 
 from __future__ import annotations
 
@@ -11,6 +11,19 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .config import Settings, settings
 from .rules import CandidateFinding, RuleLike
+
+
+PROVIDER_BASE_URLS = {
+    "openai": "https://api.openai.com/v1",
+    "groq": "https://api.groq.com/openai/v1",
+    "gemini": "https://generativelanguage.googleapis.com/v1beta/openai",
+}
+
+DEFAULT_MODELS = {
+    "openai": "gpt-4o-mini",
+    "groq": "openai/gpt-oss-20b",
+    "gemini": "gemini-3.8-flash",
+}
 
 
 class AIOutputFinding(BaseModel):
@@ -28,7 +41,10 @@ class AIOutputFinding(BaseModel):
 class AIOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    findings: list[AIOutputFinding] = Field(default_factory=list, max_length=20)
+    findings: list[AIOutputFinding] = Field(
+        default_factory=list,
+        max_length=20,
+    )
 
 
 @dataclass(frozen=True)
@@ -38,49 +54,24 @@ class AIAnalysisResult:
     error: str | None = None
 
 
-OUTPUT_SCHEMA: dict[str, object] = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "findings": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "severity": {"type": "string", "enum": ["low", "medium", "high"]},
-                    "category": {"type": "string", "enum": ["tone", "messaging", "claim"]},
-                    "label": {"type": "string"},
-                    "explanation": {"type": "string"},
-                    "suggestion": {"type": "string"},
-                    "excerpt": {"type": "string"},
-                    "rule_keys": {"type": "array", "items": {"type": "string"}},
-                },
-                "required": [
-                    "severity",
-                    "category",
-                    "label",
-                    "explanation",
-                    "suggestion",
-                    "excerpt",
-                    "rule_keys",
-                ],
-            },
-        }
-    },
-    "required": ["findings"],
-}
-
-
 def _system_prompt() -> str:
     return (
-        "You are Inkylens, an assistant that helps a human review text against supplied "
-        "organisation guidelines. Return JSON only according to the schema. Do not invent "
-        "brand policy, facts, sources, or rule keys. Only cite a rule key supplied in the "
-        "guidelines. A factual or promotional statement that is not supported by an approved "
-        "fact must be labelled exactly 'unsupported/unverified'; do not call it false. "
-        "Offer constructive, editable suggestions. Omit findings when the supplied guidance "
-        "does not support them. This output assists human review and is not a compliance decision."
+        "You are Inkylens, an AI assistant helping a human review content "
+        "against supplied brand guidelines. Return JSON only, without "
+        "Markdown or surrounding commentary, matching this structure: "
+        '{"findings":[{"severity":"low|medium|high",'
+        '"category":"tone|messaging|claim","label":"short label",'
+        '"explanation":"why this needs review",'
+        '"suggestion":"a constructive rewrite",'
+        '"excerpt":"exact text from the submitted content",'
+        '"rule_keys":["actual supplied rule keys"]}]}. '
+        "Use an empty findings array when no supported issue is found. "
+        "Do not invent brand policies, approved facts, sources, or rule keys. "
+        "Only reference rule keys present in the supplied guidelines. "
+        "Check tone, messaging, and unsupported promotional or factual claims. "
+        "A claim that lacks support must be described as "
+        "'unsupported/unverified', not declared false. "
+        "Suggestions are advisory and must not override human judgement."
     )
 
 
@@ -95,34 +86,86 @@ def _user_prompt(text: str, rules: Iterable[RuleLike]) -> str:
         }
         for rule in rules
     ]
+
     return (
-        "Review the following content using only these supplied guidelines. Focus on tone, "
-        "messaging, and unsupported claims that deterministic checks may not catch.\n\n"
-        f"GUIDELINES:\n{json.dumps(guideline_payload, ensure_ascii=False)}\n\n"
+        "Review the supplied content using only these brand guidelines. "
+        "Identify contextual problems that simple keyword checks might miss. "
+        "For each finding, quote an exact excerpt from the content and cite "
+        "only relevant rule keys. Do not invent missing evidence.\n\n"
+        f"GUIDELINES:\n"
+        f"{json.dumps(guideline_payload, ensure_ascii=False)}\n\n"
         f"CONTENT:\n{text}"
     )
 
 
-def _response_text(payload: dict[str, object]) -> str:
-    direct = payload.get("output_text")
-    if isinstance(direct, str) and direct.strip():
-        return direct
+def _extract_message_content(payload: dict) -> str:
+    """Extract the assistant's text from a Chat Completions response."""
+    choices = payload.get("choices")
 
-    output = payload.get("output")
-    if not isinstance(output, list):
-        raise ValueError("AI response did not include output text.")
-    for item in output:
-        if not isinstance(item, dict):
-            continue
-        content = item.get("content")
-        if not isinstance(content, list):
-            continue
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "output_text":
-                text = part.get("text")
-                if isinstance(text, str) and text.strip():
-                    return text
-    raise ValueError("AI response did not include structured output text.")
+    if not isinstance(choices, list) or not choices:
+        raise ValueError("AI response did not contain any choices.")
+
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        raise ValueError("AI response contained an invalid choice.")
+
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        raise ValueError("AI response did not contain an assistant message.")
+
+    content = message.get("content")
+
+    if isinstance(content, str) and content.strip():
+        return content
+
+    # Some compatible APIs may represent message content as text blocks.
+    if isinstance(content, list):
+        parts = [
+            part["text"]
+            for part in content
+            if isinstance(part, dict)
+            and isinstance(part.get("text"), str)
+        ]
+        if parts:
+            return "\n".join(parts)
+
+    raise ValueError("AI response did not contain usable text.")
+
+
+def _get_provider_settings(config: Settings):
+    """Support new provider settings and legacy OpenAI-only settings."""
+    provider = getattr(config, "ai_provider", "openai")
+    provider = (provider or "openai").strip().lower()
+
+    if provider not in PROVIDER_BASE_URLS:
+        raise ValueError(
+            "Unsupported AI provider. Choose openai, groq, or gemini."
+        )
+
+    if hasattr(config, "ai_api_key"):
+        api_key = config.ai_api_key
+    elif provider == "openai":
+        api_key = getattr(config, "openai_api_key", None)
+    else:
+        api_key = None
+
+    if hasattr(config, "ai_model"):
+        model = config.ai_model
+    elif provider == "openai":
+        model = getattr(config, "openai_model", None)
+    else:
+        model = None
+
+    model = (model or DEFAULT_MODELS[provider]).strip()
+
+    base_url = getattr(config, "ai_base_url", None)
+    base_url = (
+        base_url.strip().rstrip("/")
+        if isinstance(base_url, str) and base_url.strip()
+        else PROVIDER_BASE_URLS[provider]
+    )
+
+    return provider, api_key, model, base_url
 
 
 def analyze_with_ai(
@@ -132,54 +175,94 @@ def analyze_with_ai(
     config: Settings | None = None,
     client: httpx.Client | None = None,
 ) -> AIAnalysisResult:
-    """Attempt AI analysis without ever hiding an unavailable or invalid result."""
+    """Run AI review while reporting unavailable or invalid results honestly."""
     active_config = config or settings
     rule_list = list(rules)
-    if not active_config.ai_enabled:
+
+    try:
+        provider, api_key, model, base_url = _get_provider_settings(
+            active_config
+        )
+    except (AttributeError, TypeError, ValueError):
         return AIAnalysisResult(
             status="unavailable",
             findings=[],
-            error="AI analysis is not configured. Deterministic checks are still available.",
+            error="AI provider configuration is invalid.",
         )
 
+    if not api_key or not api_key.strip():
+        return AIAnalysisResult(
+            status="unavailable",
+            findings=[],
+            error=(
+                f"{provider.capitalize()} AI is not configured. "
+                "Deterministic checks are still available."
+            ),
+        )
+
+    if not model:
+        return AIAnalysisResult(
+            status="unavailable",
+            findings=[],
+            error="The selected AI model is not configured.",
+        )
+
+    # JSON object mode is used for broad provider compatibility.
+    # Pydantic still validates every returned field on our server.
     payload = {
-        "model": active_config.openai_model,
-        "input": [
-            {"role": "system", "content": _system_prompt()},
-            {"role": "user", "content": _user_prompt(text, rule_list)},
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": _system_prompt(),
+            },
+            {
+                "role": "user",
+                "content": _user_prompt(text, rule_list),
+            },
         ],
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": "inkylens_review",
-                "strict": True,
-                "schema": OUTPUT_SCHEMA,
-            }
-        },
+        "response_format": {"type": "json_object"},
+        "temperature": 0.1,
     }
+
     headers = {
-        "Authorization": f"Bearer {active_config.openai_api_key}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
 
     owns_client = client is None
-    request_client = client or httpx.Client(timeout=active_config.ai_timeout_seconds)
+    request_client = client or httpx.Client(
+        timeout=active_config.ai_timeout_seconds
+    )
+
     try:
         response = request_client.post(
-            "https://api.openai.com/v1/responses", headers=headers, json=payload
+            f"{base_url}/chat/completions",
+            headers=headers,
+            json=payload,
         )
         response.raise_for_status()
-        output = AIOutput.model_validate_json(_response_text(response.json()))
+
+        response_payload = response.json()
+        if not isinstance(response_payload, dict):
+            raise ValueError("AI response was not a JSON object.")
+
+        raw_content = _extract_message_content(response_payload)
+        output = AIOutput.model_validate_json(raw_content)
+
         known_rule_keys = {rule.rule_key for rule in rule_list}
         findings: list[CandidateFinding] = []
+
         for finding in output.findings:
+            # Never trust a model-generated rule reference that does not
+            # exist in the supplied brand guidelines.
             if not set(finding.rule_keys).issubset(known_rule_keys):
                 continue
-            label = (
-                "unsupported/unverified"
-                if finding.category == "claim" and not finding.rule_keys
-                else finding.label
-            )
+
+            label = finding.label
+            if finding.category == "claim" and not finding.rule_keys:
+                label = "unsupported/unverified"
+
             findings.append(
                 CandidateFinding(
                     source="ai_assisted",
@@ -192,34 +275,53 @@ def analyze_with_ai(
                     rule_keys=finding.rule_keys,
                 )
             )
-        return AIAnalysisResult(status="completed", findings=findings)
+
+        return AIAnalysisResult(
+            status="completed",
+            findings=findings,
+        )
+
     except httpx.TimeoutException:
         return AIAnalysisResult(
             status="failed",
             findings=[],
-            error="AI analysis timed out. Please retry; deterministic findings are still available.",
+            error=(
+                "AI analysis timed out. Please retry; "
+                "deterministic findings are still available."
+            ),
         )
+
     except httpx.HTTPStatusError as error:
         return AIAnalysisResult(
             status="failed",
             findings=[],
             error=(
-                f"AI analysis is temporarily unavailable (provider status {error.response.status_code}). "
-                "Please retry; deterministic findings are still available."
+                f"AI provider returned HTTP "
+                f"{error.response.status_code}. Check the provider, model, "
+                "key and API quota. Deterministic findings are still available."
             ),
         )
+
     except (ValidationError, ValueError, TypeError, json.JSONDecodeError):
         return AIAnalysisResult(
             status="failed",
             findings=[],
-            error="AI returned an invalid result. Please retry; deterministic findings are still available.",
+            error=(
+                "AI returned an invalid result. Please retry; "
+                "deterministic findings are still available."
+            ),
         )
+
     except httpx.HTTPError:
         return AIAnalysisResult(
             status="failed",
             findings=[],
-            error="AI analysis could not be reached. Please retry; deterministic findings are still available.",
+            error=(
+                "AI provider could not be reached. Please retry; "
+                "deterministic findings are still available."
+            ),
         )
+
     finally:
         if owns_client:
             request_client.close()
